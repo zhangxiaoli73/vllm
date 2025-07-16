@@ -251,8 +251,7 @@ class Fp8LinearMethod(LinearMethodBase):
         weight = ModelWeightParameter(data=torch.empty(
             output_size_per_partition,
             input_size_per_partition,
-            dtype=weight_dtype,
-            device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None),
+            dtype=weight_dtype),
                                       input_dim=1,
                                       output_dim=0,
                                       weight_loader=weight_loader)
@@ -398,7 +397,9 @@ class Fp8LinearMethod(LinearMethodBase):
         if current_platform.is_xpu():
             weight = layer.weight.data
             scale = layer.weight_scale.data
-            output = torch.ops.torch_ipex.fp8_gemm_w8a16(x, weight, True, scale, bias)
+            output = torch.ops.vllm.fp8_gemm(x, False, weight, True, None,
+                                             x.dtype, None, scale, bias, False)
+            #output = torch.ops.torch_ipex.fp8_gemm_w8a16(x, weight, True, scale, bias)
             return output
 
         if self.use_marlin:
