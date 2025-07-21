@@ -238,7 +238,8 @@ class SequenceParallelismPass(VllmInductorPass):
 
     def __init__(self, config: VllmConfig):
         super().__init__(config)
-
+        
+        print(f"zl_debug in SequenceParallelismPass", flush=True)
         self.patterns: PatternMatcherPass = PatternMatcherPass(
             pass_name="sequence_parallelism_pass")
         for epsilon in [1e-5, 1e-6]:

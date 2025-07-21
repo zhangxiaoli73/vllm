@@ -6,6 +6,7 @@ import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+from torch.distributed._symmetric_memory import _test_mode
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
@@ -31,13 +32,14 @@ class GEMMReduceScatterPattern(BasePattern):
 
     def get_inputs(self):
         mul = torch.empty([16, 4], device=self.device, dtype=self.dtype)
-        mm_weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        return [mul, mm_weight]
+        mm_weight = torch.empty([4, 4], device=self.device, dtype=torch.float8_e5m2)
+        mm_scale = torch.empty([1], device=self.device, dtype=self.dtype)
+        return [mul, mm_weight, mm_scale]
 
     def register(self, pm_pass: PatternMatcherPass):
 
-        def pattern(mul: torch.Tensor, mm_weight: torch.Tensor):
-            mm = torch.ops.aten.mm.default(mul, mm_weight)
+        def pattern(mul: torch.Tensor, mm_weight: torch.Tensor, mm_scale: torch.Tensor):
+            mm = torch.ops.vllm.fp8_gemm.default(mul, False, mm_weight, True, None, self.dtype, None, mm_scale, None, False)#torch.ops.aten.mm.default(mul, mm_weight)
             reduce_scatter = torch.ops.vllm.reduce_scatter.default(
                 mm,
                 dim=0,
@@ -45,13 +47,18 @@ class GEMMReduceScatterPattern(BasePattern):
                 group_name=self.tp.unique_name)
             return reduce_scatter
 
-        def replacement(mul: torch.Tensor, mm_weight: torch.Tensor):
-            gemm_rs = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+        def replacement(mul: torch.Tensor, mm_weight: torch.Tensor, mm_scale: torch.Tensor):
+            output_shape = [*mul.shape[:-1], mm_weight.shape[0]]
+            gemm_rs = torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
                 mul,
                 mm_weight,
+                None,
+                mm_scale,
                 "avg",
-                scatter_dim=0,
+                orig_scatter_dim=0,
+                scatter_dim_after_maybe_reshape=0,
                 group_name=self.tp.device_group.group_name,
+                output_shape=output_shape,
             )
 
             return gemm_rs
@@ -64,15 +71,17 @@ class AllGatherGEMMPattern(BasePattern):
 
     def get_inputs(self):
         x = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=torch.float8_e5m2)
+        mm_scale = torch.empty([1], device=self.device, dtype=self.dtype)
 
-        return [x, weight]
+        return [x, weight, mm_scale]
 
     def register(self, pm_pass: PatternMatcherPass):
 
         def pattern(
             x: torch.Tensor,
             weight: torch.Tensor,
+            mm_scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             all_gather = torch.ops.vllm.all_gather.default(
                 x,
@@ -80,16 +89,24 @@ class AllGatherGEMMPattern(BasePattern):
                 world_size=self.tp_size,
                 group_name=self.tp.unique_name)
 
-            return torch.ops.aten.mm.default(all_gather, weight)
+            return torch.ops.vllm.fp8_gemm.default(x, False, weight, True, None, self.dtype, None, mm_scale, None, False)
+
+            #return torch.ops.aten.mm.default(all_gather, weight)
 
         def replacement(
                 x: torch.Tensor,
-                weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            ag_output, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+                weight: torch.Tensor, mm_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            ag_output, mm_outputs = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
                 x,
                 [weight],
+                None,
+                [mm_scale],
                 gather_dim=0,
                 group_name=self.tp.device_group.group_name,
+                biases=[None],
+                result_scales=[None],
+                out_dtypes=[self.dtype],
+                use_fast_accum=[False],
             )
             return mm_outputs
 
