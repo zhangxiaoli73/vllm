@@ -32,6 +32,75 @@ class GEMMReduceScatterPattern(BasePattern):
 
     def get_inputs(self):
         mul = torch.empty([16, 4], device=self.device, dtype=self.dtype)
+        mm_weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        return [mul, mm_weight]
+
+    def register(self, pm_pass: PatternMatcherPass):
+
+        def pattern(mul: torch.Tensor, mm_weight: torch.Tensor):
+            mm = torch.ops.aten.mm.default(mul, mm_weight)
+            reduce_scatter = torch.ops.vllm.reduce_scatter.default(
+                mm,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name)
+            return reduce_scatter
+
+        def replacement(mul: torch.Tensor, mm_weight: torch.Tensor):
+            gemm_rs = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                mul,
+                mm_weight,
+                "avg",
+                scatter_dim=0,
+                group_name=self.tp.device_group.group_name,
+            )
+
+            return gemm_rs
+
+        pm.register_replacement(pattern, replacement, self.get_inputs(),
+                                pm.fwd_only, pm_pass)
+
+
+class AllGatherGEMMPattern(BasePattern):
+
+    def get_inputs(self):
+        x = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+
+        return [x, weight]
+
+    def register(self, pm_pass: PatternMatcherPass):
+
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            all_gather = torch.ops.vllm.all_gather.default(
+                x,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name)
+
+            return torch.ops.aten.mm.default(all_gather, weight)
+
+        def replacement(
+                x: torch.Tensor,
+                weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            ag_output, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+                x,
+                [weight],
+                gather_dim=0,
+                group_name=self.tp.device_group.group_name,
+            )
+            return mm_outputs
+
+        pm.register_replacement(pattern, replacement, self.get_inputs(),
+                                pm.fwd_only, pm_pass)
+
+class GEMMReduceScatterPattern(BasePattern):
+
+    def get_inputs(self):
+        mul = torch.empty([16, 4], device=self.device, dtype=self.dtype)
         mm_weight = torch.empty([4, 4], device=self.device, dtype=torch.float8_e5m2)
         mm_scale = torch.empty([1], device=self.device, dtype=self.dtype)
         return [mul, mm_weight, mm_scale]
@@ -127,6 +196,12 @@ class AsyncTPPass(VllmInductorPass):
                                  self.device).register(self.patterns)
 
         AllGatherGEMMPattern(self.model_dtype,
+                                self.device).register(self.patterns)
+
+        GEMMReduceScatterPatternFP8(self.model_dtype,
+                                 self.device).register(self.patterns)
+
+        AllGatherGEMMPatternFP8(self.model_dtype,
                              self.device).register(self.patterns)
 
     def is_applicable_for_shape(self, shape: Optional[int]) -> bool:
