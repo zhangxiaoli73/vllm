@@ -3,25 +3,22 @@ import pytest
 from vllm.model_executor.models.llama import LlamaAttention, LlamaConfig
 from vllm.config import CacheConfig, QuantizationConfig
 
-@pytest.mark.parametrize("num_heads,num_kv_heads", [
-    (8, 4),   # kv_heads >= tp
-    (8, 2),   # kv_heads < tp
-])
-def test_llama_attention_forward_tp4(num_heads, num_kv_heads):
+os.environ['RANK'] = str(os.environ.get('PMI_RANK', 0))
+os.environ['WORLD_SIZE'] = str(os.environ.get('PMI_SIZE', 1))
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '29803'
+dist.init_process_group(backend='xccl')
+
+def test_llama_attention_forward_tp4(config, num_kv_heads):
     # 模拟 TP=4 环境
     from vllm.model_executor.models import llama
-    llama.get_tensor_model_parallel_world_size = lambda: 4
+    llama.get_tensor_model_parallel_world_size = dist.get_world_size()
 
-    hidden_size = 64
     batch_size = 2
     seq_len = 5
-
-    # 构造 LlamaConfig
-    config = LlamaConfig(
-        hidden_size=hidden_size,
-        num_attention_heads=num_heads,
-        vocab_size=100,
-    )
+    num_heads = 128
+    num_kv_heads = 8
+    hidden_size = 4096
 
     attn = LlamaAttention(
         config=config,
@@ -53,3 +50,17 @@ def test_llama_attention_forward_tp4(num_heads, num_kv_heads):
         if param.requires_grad:
             assert param.grad is not None, f"Parameter {name} did not get gradients"
 
+
+if __name__ == '__main__':
+    # 构造 LlamaConfig
+    config = LlamaConfig(
+        hidden_size=hidden_size,
+        num_attention_heads=num_heads,
+        vocab_size=100,
+    )
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    torch.xpu.set_device(rank)
+    test_llama_attention_forward_tp4(config)
