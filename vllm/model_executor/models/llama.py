@@ -103,7 +103,22 @@ class LlamaMLP(nn.Module):
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
-        return x
+
+        # all gather
+        def compute_shard_comsumer(in_shard: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+            out, _ = self.gate_up_proj(in_shard)
+            out = self.act_fn(out)
+            out, _ = self.down_proj(out)
+            output.copy_(out)
+
+        output = _fused_all_gather_matmul_reducescatter(
+            shard_consumer=compute_shard_comsumer,
+            A_shard=hidden_states,
+            N_dim=hidden_size,
+            group_name=dist.group.WORLD.group_name,  # 默认进程组
+        )
+
+        return output
 
 
 class LlamaAttention(nn.Module):
@@ -155,7 +170,7 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = (QKVParallelLinear(
             hidden_size=hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
@@ -163,7 +178,7 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-        )
+        ))
 
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,

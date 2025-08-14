@@ -1,5 +1,8 @@
 import torch
-import pytest
+import os
+import torch.distributed as dist
+
+from tests.lora.test_punica_ops import hidden_size
 from vllm.model_executor.models.llama import LlamaAttention, LlamaConfig
 from vllm.config import CacheConfig, QuantizationConfig
 
@@ -9,8 +12,7 @@ os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '29803'
 dist.init_process_group(backend='xccl')
 
-def test_llama_attention_forward_tp4(config, num_kv_heads):
-    # 模拟 TP=4 环境
+def test_llama_attention_forward_tp4(config):
     from vllm.model_executor.models import llama
     llama.get_tensor_model_parallel_world_size = dist.get_world_size()
 
@@ -53,6 +55,8 @@ def test_llama_attention_forward_tp4(config, num_kv_heads):
 
 if __name__ == '__main__':
     # 构造 LlamaConfig
+    hidden_size = 4096
+    num_heads = 128
     config = LlamaConfig(
         hidden_size=hidden_size,
         num_attention_heads=num_heads,
