@@ -2,7 +2,6 @@ import torch
 import os
 import torch.distributed as dist
 
-from tests.lora.test_punica_ops import hidden_size
 from vllm.model_executor.models.llama import LlamaAttention, LlamaConfig
 from vllm.config import CacheConfig, QuantizationConfig
 

@@ -27,6 +27,7 @@ from typing import Any, Optional, Union
 
 import torch
 from torch import nn
+
 from transformers import LlamaConfig
 
 from vllm.attention import Attention, AttentionType
@@ -98,12 +99,9 @@ class LlamaMLP(nn.Module):
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
+        self.hidden_size = hidden_size
 
     def forward(self, x):
-        x, _ = self.gate_up_proj(x)
-        x = self.act_fn(x)
-        x, _ = self.down_proj(x)
-
         # all gather
         def compute_shard_comsumer(in_shard: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
             out, _ = self.gate_up_proj(in_shard)
@@ -113,10 +111,11 @@ class LlamaMLP(nn.Module):
 
         output = _fused_all_gather_matmul_reducescatter(
             shard_consumer=compute_shard_comsumer,
-            A_shard=hidden_states,
-            N_dim=hidden_size,
+            A_shard=x,
+            N_dim=self.hidden_size,
             group_name=dist.group.WORLD.group_name,  # 默认进程组
         )
+        print(f"[In MLP]zl_debug output shape  = {output.shape}, input shape  = {x.shape}")
 
         return output
 
@@ -179,6 +178,7 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         ))
+        # self.qkv_proj = nn.Linear(in_features = hidden_size, out_features = (num_kv_heads*2 + num_heads)*head_dim, bias=False)
 
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
@@ -187,7 +187,6 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-
         self._init_rotary_emb(config,
                               rope_scaling=rope_scaling,
                               quant_config=quant_config)
@@ -216,6 +215,7 @@ class LlamaAttention(nn.Module):
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
         )
+        self.hidden_size = hidden_size
 
     def forward(
         self,
@@ -234,9 +234,11 @@ class LlamaAttention(nn.Module):
         output = _fused_all_gather_matmul_reducescatter(
             shard_consumer=compute_shard_comsumer,
             A_shard=hidden_states,
-            N_dim=hidden_size,
+            N_dim=self.hidden_size,
             group_name=dist.group.WORLD.group_name,  # 默认进程组
         )
+        print(f"[In Attention]zl_debug output shape  = {output.shape}, input shape  = {hidden_states.shape}")
+
         # reduce scatter
         return output
 
@@ -412,20 +414,26 @@ class LlamaModel(nn.Module):
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+                print("zl_debug FFFFFFFFFFFFFFFFFFFFFFFFFFFF")
             else:
+                print("[LLAMA model] zl_debug in llama model, start to do embedding")
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
+            print("zl_debug FFFFFFFFFFFFFFFFFFFFFFFFFFFF")
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        print(f"[LLAMA model] zl_debug in llama model with hidden states from embedding {hidden_states.shape}, input ids = {inputs_embeds.shape}")
         aux_hidden_states = []
         for idx, layer in enumerate(
                 self.layers[self.start_layer:self.end_layer]):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
+            print(f"[LLAMA model] zl_debug before decoder layer hidden_states = {hidden_states.shape} positions = {positions.shape}")
             hidden_states, residual = layer(positions, hidden_states, residual)
+            print(f"[LLAMA model] zl_debug after decoder layer hidden_states = {hidden_states.shape} residual = {residual.shape}")
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
