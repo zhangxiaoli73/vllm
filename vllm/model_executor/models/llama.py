@@ -53,6 +53,17 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+import torch.distributed as dist
+import torch.distributed as dist
+from torch.distributed._symmetric_memory import (
+    _fused_all_gather_matmul_fallback,
+    _fused_all_gather_scaled_matmul_fallback,
+    _fused_matmul_reduce_scatter_fallback,
+    _fused_all_gather_matmul_reducescatter,
+    enable_symm_mem_for_group,
+    restride_A_for_fused_matmul_reduce_scatter,
+    restride_A_shard_for_fused_all_gather_matmul,
+)
 
 
 class LlamaMLP(nn.Module):
@@ -196,11 +207,22 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        # all gather
+        def compute_shard_comsumer(in_shard: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            qkv, _ = self.qkv_proj(in_shard)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v)
+            output, _ = self.o_proj(attn_output)
+            out.copy_(output)
+
+        output = _fused_all_gather_matmul_reducescatter(
+            shard_consumer=compute_shard_comsumer,
+            A_shard=hidden_states,
+            N_dim=hidden_size,
+            group_name=dist.group.WORLD.group_name,  # 默认进程组
+        )
+        # reduce scatter
         return output
 
     def _init_rotary_emb(self, config: LlamaConfig,
