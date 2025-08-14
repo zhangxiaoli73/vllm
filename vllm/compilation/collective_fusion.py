@@ -97,7 +97,7 @@ class AllGatherGEMMPattern(BasePattern):
         pm.register_replacement(pattern, replacement, self.get_inputs(),
                                 pm.fwd_only, pm_pass)
 
-class GEMMReduceScatterPattern(BasePattern):
+class GEMMReduceScatterPatternFP8(BasePattern):
 
     def get_inputs(self):
         mul = torch.empty([16, 4], device=self.device, dtype=self.dtype)
@@ -136,7 +136,7 @@ class GEMMReduceScatterPattern(BasePattern):
                                 pm.fwd_only, pm_pass)
 
 
-class AllGatherGEMMPattern(BasePattern):
+class AllGatherGEMMPatternFP8(BasePattern):
 
     def get_inputs(self):
         x = torch.empty([4, 4], device=self.device, dtype=self.dtype)
