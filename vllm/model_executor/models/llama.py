@@ -208,6 +208,7 @@ class LlamaAttention(nn.Module):
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
         )
+        self.hidden_size = hidden_size
 
     def forward(
         self,
@@ -215,14 +216,41 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         all_hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
-        qkv, _ = self.qkv_proj(all_hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        first_hidden_states = all_hidden_states[:all_hidden_states.size(0)//2, :]
+        second_hidden_states = all_hidden_states[all_hidden_states.size(0)//2:, :]
+
+        all_output = torch.ones_like(all_hidden_states)
+        first_output = all_output[:all_output.size(0)//2, :]
+        second_output = all_output[:all_output.size(0)//2, :]
+
+        def compute_shard_comsumer(in_shard: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            qkv, _ = self.qkv_proj(in_shard)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            torch.xpu.synchronize()
+            print(f"[Attention] zl_debug before rotary embedding Q = {q.shape} K = {k.shape} V = {v.shape}", flush=True)
+            q, k = self.rotary_emb(positions, q, k)
+            torch.xpu.synchronize()
+            print(f"[Attention] zl_debug after rotary embedding Q = {q.shape} K = {k.shape} V = {v.shape}", flush=True)
+            attn_output = self.attn(q, k, v)
+            output, _ = self.o_proj(attn_output)
+            torch.xpu.synchronize()
+            print(f"[Attention] zl_debug after output projection attention_output = {attn_output.shape} {output.shape}", flush=True)
+            out.copy_(output)
+
+        # all_output = _fused_all_gather_matmul_reducescatter(
+        #     shard_consumer=compute_shard_comsumer,
+        #     A_shard=hidden_states,
+        #     N_dim=self.hidden_size,
+        #     group_name=dist.group.WORLD.group_name,  # 默认进程组
+        # )
+        # step 1: compute local
+        compute_shard_comsumer(in_shard = first_hidden_states, out = first_output)
+        compute_shard_comsumer(in_shard=second_hidden_states,out=second_output)
+        all_output = (first_output + second_output)/2
+
         # zl_debug allreduce
         # output = tensor_model_parallel_all_reduce(output)
-        all_output = tensor_model_parallel_reduce_scatter(output, dim=0)
+        # all_output = tensor_model_parallel_reduce_scatter(output, dim=0)
         return all_output
 
     def _init_rotary_emb(self, config: LlamaConfig,
