@@ -423,8 +423,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
         # output = tensor_model_parallel_all_reduce(output_parallel)
-        output = tensor_model_parallel_reduce_scatter(output_parallel, dim = 0)
-        all_output = tensor_model_parallel_all_gather(output, dim = 0)
+        all_output = tensor_model_parallel_reduce_scatter(output_parallel, dim = 0)
+        # all_output = tensor_model_parallel_all_gather(output, dim = 0)
         return all_output
 
     def extra_repr(self) -> str:

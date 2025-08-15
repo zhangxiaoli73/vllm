@@ -27,6 +27,7 @@ from typing import Any, Optional, Union
 
 import torch
 from torch import nn
+
 from transformers import LlamaConfig
 
 from vllm.attention import Attention, AttentionType
@@ -53,7 +54,22 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+import torch.distributed as dist
+import torch.distributed as dist
+from torch.distributed._symmetric_memory import (
+    _fused_all_gather_matmul_fallback,
+    _fused_all_gather_scaled_matmul_fallback,
+    _fused_matmul_reduce_scatter_fallback,
+    _fused_all_gather_matmul_reducescatter,
+    enable_symm_mem_for_group,
+    restride_A_for_fused_matmul_reduce_scatter,
+    restride_A_shard_for_fused_all_gather_matmul,
+)
 
+from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_reduce_scatter)
 
 class LlamaMLP(nn.Module):
 
@@ -88,12 +104,14 @@ class LlamaMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, y):
+        x = tensor_model_parallel_all_gather(y, dim = 0)
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
-        x = tensor_model_parallel_all_reduce(x)
-        return x
+        z = tensor_model_parallel_reduce_scatter(x, dim = 0)
+        # x = tensor_model_parallel_all_reduce(x)
+        return z
 
 
 class LlamaAttention(nn.Module):
@@ -162,7 +180,6 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-
         self._init_rotary_emb(config,
                               rope_scaling=rope_scaling,
                               quant_config=quant_config)
@@ -197,14 +214,16 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        all_hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+        qkv, _ = self.qkv_proj(all_hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         # zl_debug allreduce
-        output = tensor_model_parallel_all_reduce(output)
-        return output
+        # output = tensor_model_parallel_all_reduce(output)
+        all_output = tensor_model_parallel_reduce_scatter(output, dim=0)
+        return all_output
 
     def _init_rotary_emb(self, config: LlamaConfig,
                          rope_scaling: Optional[dict[str, Any]],
@@ -390,20 +409,25 @@ class LlamaModel(nn.Module):
         for idx, layer in enumerate(
                 self.layers[self.start_layer:self.end_layer]):
             if idx in self.aux_hidden_state_layers:
+                print("FFFFFFFFFFFFFFFFFFF zl_debug failed")
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
 
+        all_hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+        all_residual = tensor_model_parallel_all_gather(residual, dim=0)
+
         if not get_pp_group().is_last_rank:
+            print("!!!!!!!!!!!!!!!!!!!!!!!!! zl_debug failed")
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        all_hidden_states, _ = self.norm(all_hidden_states, all_residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
-        return hidden_states
+        return all_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
