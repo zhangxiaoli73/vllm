@@ -423,9 +423,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Reduce across all the model parallel GPUs.
         # output = tensor_model_parallel_all_reduce(output_parallel)
         # zl_debug
-        print(f"[In VocabParallelEmbedding] zl_debug start to output parallel shape = {output_parallel.shape}")
+        print(f"[In VocabParallelEmbedding] zl_debug start to output parallel shape = {output_parallel.shape}", flush=True)
         output = tensor_model_parallel_reduce_scatter(output_parallel, dim = 0)
-        print(f"[In VocabParallelEmbedding] zl_debug after reducescatter to output shape = {output.shape}")
+        print(f"[In VocabParallelEmbedding] zl_debug after reducescatter to output shape = {output.shape}", flush=True)
         return output
 
     def extra_repr(self) -> str:

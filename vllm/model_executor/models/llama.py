@@ -66,6 +66,10 @@ from torch.distributed._symmetric_memory import (
     restride_A_shard_for_fused_all_gather_matmul,
 )
 
+from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_reduce_scatter)
 
 class LlamaMLP(nn.Module):
 
@@ -226,9 +230,15 @@ class LlamaAttention(nn.Module):
         def compute_shard_comsumer(in_shard: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
             qkv, _ = self.qkv_proj(in_shard)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self.rotary_emb(positions, q, k)
+            torch.xpu.synchronize()
+            print(f"[Attention] zl_debug before rotary embedding Q = {q.shape} K = {k.shape} V = {v.shape}", flush=True)
+            # q, k = self.rotary_emb(positions, q, k)
+            torch.xpu.synchronize()
+            print(f"[Attention] zl_debug after rotary embedding Q = {q.shape} K = {k.shape} V = {v.shape}", flush=True)
             attn_output = self.attn(q, k, v)
             output, _ = self.o_proj(attn_output)
+            torch.xpu.synchronize()
+            print(f"[Attention] zl_debug after output projection attention_output = {attn_output.shape} {output.shape}", flush=True)
             out.copy_(output)
 
         output = _fused_all_gather_matmul_reducescatter(
@@ -237,7 +247,7 @@ class LlamaAttention(nn.Module):
             N_dim=self.hidden_size,
             group_name=dist.group.WORLD.group_name,  # 默认进程组
         )
-        print(f"[In Attention]zl_debug output shape  = {output.shape}, input shape  = {hidden_states.shape}")
+        print(f"[In Attention]zl_debug output shape  = {output.shape}, input shape  = {hidden_states.shape}", flush=True)
 
         # reduce scatter
         return output
@@ -340,12 +350,17 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        torch.xpu.synchronize()
+        print(f"[LLAMA decode layer] zl_debug before attention, hidden status = {hidden_states.shape}", flush=True)
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states)
-
+        torch.xpu.synchronize()
+        print(f"[LLAMA decode layer] zl_debug post attention layernorm, hidden states = {hidden_states.shape}", flush=True)
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+        torch.xpu.synchronize()
+        print(f"[LLAMA decode layer] zl_debug before MLP, hidden status = {hidden_states.shape} residual = {residual.shape}", flush=True)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -382,7 +397,7 @@ class LlamaModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
+            1, #config.num_hidden_layers,
             lambda prefix: layer_type(config=config,
                                       cache_config=cache_config,
                                       quant_config=quant_config,
@@ -414,38 +429,45 @@ class LlamaModel(nn.Module):
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
-                print("zl_debug FFFFFFFFFFFFFFFFFFFFFFFFFFFF")
+                print("zl_debug FFFFFFFFFFFFFFFFFFFFFFFFFFFF", flush=True)
             else:
-                print("[LLAMA model] zl_debug in llama model, start to do embedding")
+                print("[LLAMA model] zl_debug in llama model, start to do embedding", flush=True)
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
-            print("zl_debug FFFFFFFFFFFFFFFFFFFFFFFFFFFF")
+            print("zl_debug FFFFFFFFFFFFFFFFFFFFFFFFFFFF", flush=True)
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        print(f"[LLAMA model] zl_debug in llama model with hidden states from embedding {hidden_states.shape}, input ids = {inputs_embeds.shape}")
+        torch.xpu.synchronize()
+        print(f"[LLAMA model] zl_debug in llama model with hidden states from embedding {hidden_states.shape}", flush=True)
         aux_hidden_states = []
         for idx, layer in enumerate(
                 self.layers[self.start_layer:self.end_layer]):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            print(f"[LLAMA model] zl_debug before decoder layer hidden_states = {hidden_states.shape} positions = {positions.shape}")
+            print(f"[LLAMA model] zl_debug before decoder layer hidden_states = {hidden_states.shape} positions = {positions.shape}", flush=True)
             hidden_states, residual = layer(positions, hidden_states, residual)
-            print(f"[LLAMA model] zl_debug after decoder layer hidden_states = {hidden_states.shape} residual = {residual.shape}")
+            torch.xpu.synchronize()
+            print(f"[LLAMA model] zl_debug after decoder layer hidden_states = {hidden_states.shape} residual = {residual.shape}", flush=True)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-
-        hidden_states, _ = self.norm(hidden_states, residual)
+        print(f"[LLAMA model] zl_debug before last norm, hidden_state = {hidden_states.shape} residual = {residual.shape}", flush=True)
+        allgather_hidden_states = tensor_model_parallel_all_gather(hidden_states, dim = 0)
+        allgather_residual = tensor_model_parallel_all_gather(residual, dim = 0)
+        print(f"[LLAMA model] zl_debug before last norm to do allgather, hidden_state = {allgather_hidden_states.shape} residual = {allgather_residual.shape}", flush=True)
+        allgather_hidden_states, _ = self.norm(allgather_hidden_states, allgather_residual)
+        torch.xpu.synchronize()
+        print(f"[LLAMA model] zl_debug after last norm, hidden_state = {allgather_hidden_states.shape}", flush=True)
 
         if len(aux_hidden_states) > 0:
-            return hidden_states, aux_hidden_states
-        return hidden_states
+            return allgather_hidden_states, aux_hidden_states
+        return allgather_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
