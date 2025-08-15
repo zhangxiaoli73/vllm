@@ -92,6 +92,7 @@ class LlamaMLP(nn.Module):
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
+        x = tensor_model_parallel_all_reduce(x)
         return x
 
 
@@ -201,6 +202,8 @@ class LlamaAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
+        # zl_debug allreduce
+        output = tensor_model_parallel_all_reduce(output)
         return output
 
     def _init_rotary_emb(self, config: LlamaConfig,

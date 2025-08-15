@@ -10,7 +10,9 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
+                              tensor_model_parallel_all_reduce,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_reduce_scatter)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase, method_has_implemented_embedding)
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
@@ -420,8 +422,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
-        return output
+        # output = tensor_model_parallel_all_reduce(output_parallel)
+        output = tensor_model_parallel_reduce_scatter(output_parallel, dim = 0)
+        all_output = tensor_model_parallel_all_gather(output, dim = 0)
+        return all_output
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
