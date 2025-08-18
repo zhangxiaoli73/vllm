@@ -209,12 +209,33 @@ class LlamaAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
         self.hidden_size = hidden_size
+        self.tp_size = tp_size
+
+    def forward_ref(self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,) -> torch.Tensor:
+
+        all_hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+        qkv, _ = self.qkv_proj(all_hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        # zl_debug allreduce
+        # output = tensor_model_parallel_all_reduce(output)
+        all_output = tensor_model_parallel_reduce_scatter(output, dim=0)
+
+        return  all_output
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        print(f"zl_debug !!!!!!!!!!!!!!!!!!!! hidden state shape = {hidden_states.shape}", flush=True)
+        if hidden_states.size(0) != 4096:
+            return self. forward_ref(positions, hidden_states)
+
         all_hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
         first_hidden_states = all_hidden_states[:all_hidden_states.size(0)//2, :]
         second_hidden_states = all_hidden_states[all_hidden_states.size(0)//2:, :]
@@ -635,6 +656,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        print(f"[LlamaForCausalLM] zl_debug to get all tensors input_ids={input_ids.shape} positions={positions.shape}", flush=True)
+
         model_output = self.model(input_ids, positions, intermediate_tensors,
                                   inputs_embeds)
         return model_output

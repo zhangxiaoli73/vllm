@@ -83,14 +83,14 @@ def main(args: argparse.Namespace):
             with torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
+                    torch.profiler.ProfilerActivity.XPU,
                 ],
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     str(profile_dir)
                 ),
             ) as p:
                 llm_generate()
-            print(p.key_averages().table(sort_by="self_cuda_time_total"))
+            print(p.key_averages().table(sort_by="self_xpu_time_total"))
         else:
             start_time = time.perf_counter()
             llm_generate()
