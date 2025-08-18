@@ -19,6 +19,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.sampling_params import BeamSearchParams
 from vllm.utils import FlexibleArgumentParser
+import torch.distributed as dist
 
 
 def save_to_pytorch_benchmark_format(
@@ -78,17 +79,25 @@ def main(args: argparse.Namespace):
                 ),
             )
 
+    if args.profile:
+        profile_dir = args.profile_result_dir
+        if not profile_dir:
+            profile_dir = (
+                Path(".") / "vllm_benchmark_result" / f"latency_result_{time.time()}"
+            )
+    if args.profile:
+        prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.XPU,
+            ]
+        )
+    else:
+        prof = nullcontext
+
     def run_to_completion(profile_dir: Optional[str] = None):
         if profile_dir:
-            with torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.XPU,
-                ],
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    str(profile_dir)
-                ),
-            ) as p:
+            with prof as p:
                 llm_generate()
             print(p.key_averages().table(sort_by="self_xpu_time_total"))
         else:
@@ -102,29 +111,24 @@ def main(args: argparse.Namespace):
     for _ in tqdm(range(args.num_iters_warmup), desc="Warmup iterations"):
         run_to_completion(profile_dir=None)
 
-    if args.profile:
-        profile_dir = args.profile_result_dir
-        if not profile_dir:
-            profile_dir = (
-                Path(".") / "vllm_benchmark_result" / f"latency_result_{time.time()}"
-            )
-        print(f"Profiling (results will be saved to '{profile_dir}')...")
-        run_to_completion(profile_dir=profile_dir)
-        return
-
     # Benchmark.
     latencies = []
     for _ in tqdm(range(args.num_iters), desc="Profiling iterations"):
-        latencies.append(run_to_completion(profile_dir=None))
+        latencies.append(run_to_completion(profile_dir=profile_dir))
     latencies = np.array(latencies)
     percentages = [10, 25, 50, 75, 90, 99]
-    percentiles = np.percentile(latencies, percentages)
-    print(f"Avg latency: {np.mean(latencies)} seconds")
-    for percentage, percentile in zip(percentages, percentiles):
-        print(f"{percentage}% percentile latency: {percentile} seconds")
+    if not args.profile:
+        percentiles = np.percentile(latencies, percentages)
+        print(f"Avg latency: {np.mean(latencies)} seconds")
+        for percentage, percentile in zip(percentages, percentiles):
+            print(f"{percentage}% percentile latency: {percentile} seconds")
+
+    if args.profile:
+        print(f"Start to save profile result")
+        prof.export_chrome_trace(profile_dir = str(profile_dir) + "./profile_kineto_trace_" + str(dist.get_rank()) + ".json")
 
     # Output JSON results if specified
-    if args.output_json:
+    if args.output_json and not args.profile:
         results = {
             "avg_latency": np.mean(latencies),
             "latencies": latencies.tolist(),
