@@ -234,15 +234,16 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         print(f"zl_debug !!!!!!!!!!!!!!!!!!!! hidden state shape = {hidden_states.shape}", flush=True)
         if hidden_states.size(0) != 4096:
-            return self. forward_ref(positions, hidden_states)
+            return self.forward_ref(positions, hidden_states)
 
-        all_hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
-        first_hidden_states = all_hidden_states[:all_hidden_states.size(0)//2, :]
-        second_hidden_states = all_hidden_states[all_hidden_states.size(0)//2:, :]
-
-        all_output = torch.ones_like(all_hidden_states)
-        first_output = all_output[:all_output.size(0)//2, :]
-        second_output = all_output[:all_output.size(0)//2, :]
+        # all_hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+        # print(f"zl_debug start to do fused op, all hideen states = {all_hidden_states.shape} position={positions.shape}", flush=True)
+        # first_hidden_states = all_hidden_states[:all_hidden_states.size(0)//2, :]
+        # second_hidden_states = all_hidden_states[all_hidden_states.size(0)//2:, :]
+        #
+        # all_output = torch.ones_like(all_hidden_states)
+        # first_output = all_output[:all_output.size(0)//2, :]
+        # second_output = all_output[:all_output.size(0)//2, :]
 
         def compute_shard_comsumer(in_shard: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
             qkv, _ = self.qkv_proj(in_shard)
@@ -258,16 +259,16 @@ class LlamaAttention(nn.Module):
             print(f"[Attention] zl_debug after output projection attention_output = {attn_output.shape} {output.shape}", flush=True)
             out.copy_(output)
 
-        # all_output = _fused_all_gather_matmul_reducescatter(
-        #     shard_consumer=compute_shard_comsumer,
-        #     A_shard=hidden_states,
-        #     N_dim=self.hidden_size,
-        #     group_name=dist.group.WORLD.group_name,  # 默认进程组
-        # )
+        all_output = _fused_all_gather_matmul_reducescatter(
+            shard_consumer=compute_shard_comsumer,
+            A_shard=hidden_states,
+            N_dim=self.hidden_size,
+            group_name=dist.group.WORLD.group_name,  # 默认进程组
+        )
         # step 1: compute local
-        compute_shard_comsumer(in_shard = first_hidden_states, out = first_output)
-        compute_shard_comsumer(in_shard=second_hidden_states,out=second_output)
-        all_output = (first_output + second_output)/2
+        # compute_shard_comsumer(in_shard = first_hidden_states, out = first_output)
+        # compute_shard_comsumer(in_shard=second_hidden_states,out=second_output)
+        # all_output = (first_output + second_output)/2
 
         # zl_debug allreduce
         # output = tensor_model_parallel_all_reduce(output)
